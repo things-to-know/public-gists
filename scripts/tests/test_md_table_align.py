@@ -449,6 +449,22 @@ class CellTest(Case):
             with self.subTest(row=row):
                 self.check("| a | b |\n|-|-|\n" + row, head + expected, warning)
 
+    def test_widths(self):
+        head = "| a | b |\n|-|-|\n"
+        for cell, expected in (
+            ("日本語", "| a      | b   |\n|--------|-----|\n| 日本語 | x   |\n"),  # wide: 2 each
+            ("x\ty", "| a   | b   |\n|-----|-----|\n| x\ty  | x   |\n"),  # a control: 0
+            ("\xa0x", "| a   | b   |\n|-----|-----|\n| \xa0x  | x   |\n"),  # U+00A0 is content
+        ):
+            with self.subTest(cell=cell):
+                self.check(head + f"| {cell} | x |\n", expected)
+
+    def test_a_byte_sequence_that_is_not_utf_8_counts_as_one_replacement_character(self):
+        self.check(  # E2 82, a truncated sequence, as `surrogateescape` decodes it
+            "| a | b |\n|-|-|\n| \udce2\udc82 | y |\n",
+            "| a   | b   |\n|-----|-----|\n| \udce2\udc82   | y   |\n",
+        )
+
 
 class LineEndingTest(Case):
     """Line endings and a byte order mark pass through."""
@@ -465,8 +481,8 @@ class LineEndingTest(Case):
         self.check(TABLE.rstrip("\n"), ALIGNED.rstrip("\n"))
 
     def test_bytes_that_are_not_utf_8_pass_through_main(self):
-        text = b"caf\xe9\n\n" + TABLE.encode()
-        expected = b"caf\xe9\n\n" + ALIGNED.encode()
+        text = b"caf\xe9\n\n| a | b |\n|-|-|\n| \xe2\x82 | y |\n"
+        expected = b"caf\xe9\n\n| a   | b   |\n|-----|-----|\n| \xe2\x82   | y   |\n"
         result = subprocess.run(
             [sys.executable, "-I", str(MODULE_PATH)], input=text, capture_output=True, check=True
         )

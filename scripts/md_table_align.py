@@ -57,14 +57,24 @@ Rules:
     - The delimiter row sets the number of columns. A shorter row is padded with empty cells;
         the extra cells of a longer row, which GFM does not render, are kept as they are
         after the aligned ones and reported
-    - Widths are counted in characters, which is exact for ASCII and not for wide ones
+    - Widths are display columns per grapheme cluster, counted as the `string-width` package
+        MD060 measures with counts them: wide (CJK) characters and emoji count 2, an Indic
+        conjunct or a decomposed Hangul syllable counts as one character, and combining marks
+        and controls count 0. The emoji and cluster tables below were generated with Node
+        22.23.4, whose ICU 78.3 implements Unicode 17; the Unicode version changes with Node's
+        ICU. Everything else comes from this Python's Unicode data (15.1 on Python 3.13, 16.0
+        on 3.14, 17.0 on 3.15), so a character it does not know yet, or whose width a later
+        version changed, can count differently: on Python 3.13 a Unicode 16 emoji counts 1
+        instead of 2, the trigrams at U+2630 (wide since Unicode 16) count 1, and a combining
+        mark added later (U+0897) counts 1, not 0
     - Line endings (LF, CRLF), a byte order mark and input bytes that are not UTF-8 pass
-        through
+        through; a byte sequence that is not UTF-8 counts as the one U+FFFD Node reads it as
 """
 import argparse
 import itertools
 import re
 import sys
+import unicodedata
 from dataclasses import dataclass
 
 if sys.version_info < (3, 10):  # noqa: UP036 - a clear error instead of a TypeError later
@@ -109,9 +119,252 @@ HTML_TAG_LINE = re.compile(  # HTML block 7: a lone tag; it cannot interrupt a p
 )
 
 
+def code_points(ranges: str) -> frozenset[int]:
+    points: set[int] = set()
+    for item in ranges.split():
+        first, _, last = item.partition("-")
+        points.update(range(int(first, 16), int(last or first, 16) + 1))
+    return frozenset(points)
+
+
+# UAX #29 GB9c, Indic conjuncts: consonant, linker (a virama), consonant are one cluster.
+INCB_CONSONANTS = code_points(
+    "915-939 958-95f 978-97f 995-9a8 9aa-9b0 9b2 9b6-9b9 9dc-9dd 9df 9f0-9f1 a95-aa8 aaa-ab0 "
+    "ab2-ab3 ab5-ab9 af9 b15-b28 b2a-b30 b32-b33 b35-b39 b5c-b5d b5f b71 c15-c28 c2a-c39 "
+    "c58-c5a d15-d3a 1000-102a 103f 1050-1055 105a-105d 1061 1065-1066 106e-1070 1075-1081 "
+    "108e 1780-17b3 1a20-1a54 1b0b-1b0c 1b13-1b33 1b45-1b4c 1b83-1ba0 1bae-1baf 1bbb-1bbd "
+    "a989-a98b a98f-a9b2 a9e0-a9e4 a9e7-a9ef a9fa-a9fe aa60-aa6f aa71-aa73 aa7a aa7e-aa7f "
+    "aae0-aaea abc0-abda 10a00 10a10-10a13 10a15-10a17 10a19-10a35 11103-11126 11144 11147 "
+    "11380-11389 1138b 1138e 11390-113b5 11900-11906 11909 1190c-11913 11915-11916 "
+    "11918-1192f 11a00 11a0b-11a32 11a50 11a5c-11a83 11f04-11f10 11f12-11f33"
+)
+# Linkers (viramas) of GB9c.
+INCB_LINKERS = code_points(
+    "94d 9cd acd b4d c4d d4d 1039 17d2 1a60 1b44 1bab a9c0 aaf6 10a3f 11133 113d0 1193e 11a47 "
+    "11a99 11f42"
+)
+# Spacing marks that extend a cluster as nonspacing marks do (Grapheme_Extend, U+09BE).
+INCB_SPACING_EXTEND = code_points(
+    "9be 9d7 b3e b57 bbe bd7 cc0 cc2 cc7-cc8 cca-ccb cd5-cd6 d3e d57 dcf ddf 1715 1734 1b35 "
+    "1b3b 1b3d 1b43-1b44 1baa 1bf2-1bf3 302e-302f a953 a9c0 111c0 11235 1133e 1134d 11357 "
+    "113b8 113c2 113c5 113c7-113c9 113cf 114b0 114bd 115af 116b6 11930 1193d 11f41 "
+    "16ff0-16ff1 1d165-1d166 1d16d-1d172"
+)
+# UAX #29 GB9b: characters that join the one after them (U+0D4E MALAYALAM LETTER DOT REPH).
+PREPEND = code_points(
+    "600-605 6dd 70f 890-891 8e2 d4e 110bd 110cd 111c2-111c3 113d1 1193f 11941 11a84-11a89 "
+    "11d46 11f02"
+)
+# Extended_Pictographic: what a ZWJ joins, and what makes a ZWJ sequence 2 columns wide.
+EXTENDED_PICTOGRAPHIC = code_points(
+    "a9 ae 203c 2049 2122 2139 2194-2199 21a9-21aa 231a-231b 2328 23cf 23e9-23f3 23f8-23fa "
+    "24c2 25aa-25ab 25b6 25c0 25fb-25fe 2600-2604 260e 2611 2614-2615 2618 261d 2620 "
+    "2622-2623 2626 262a 262e-262f 2638-263a 2640 2642 2648-2653 265f-2660 2663 2665-2666 "
+    "2668 267b 267e-267f 2692-2697 2699 269b-269c 26a0-26a1 26a7 26aa-26ab 26b0-26b1 "
+    "26bd-26be 26c4-26c5 26c8 26ce-26cf 26d1 26d3-26d4 26e9-26ea 26f0-26f5 26f7-26fa 26fd "
+    "2702 2705 2708-270d 270f 2712 2714 2716 271d 2721 2728 2733-2734 2744 2747 274c 274e "
+    "2753-2755 2757 2763-2764 2795-2797 27a1 27b0 27bf 2934-2935 2b05-2b07 2b1b-2b1c 2b50 "
+    "2b55 3030 303d 3297 3299 1f004 1f02c-1f02f 1f094-1f09f 1f0af-1f0b0 1f0c0 1f0cf-1f0d0 "
+    "1f0f6-1f0ff 1f170-1f171 1f17e-1f17f 1f18e 1f191-1f19a 1f1ae-1f1e5 1f201-1f20f 1f21a "
+    "1f22f 1f232-1f23a 1f23c-1f23f 1f249-1f25f 1f266-1f321 1f324-1f393 1f396-1f397 "
+    "1f399-1f39b 1f39e-1f3f0 1f3f3-1f3f5 1f3f7-1f3fa 1f400-1f4fd 1f4ff-1f53d 1f549-1f54e "
+    "1f550-1f567 1f56f-1f570 1f573-1f57a 1f587 1f58a-1f58d 1f590 1f595-1f596 1f5a4-1f5a5 "
+    "1f5a8 1f5b1-1f5b2 1f5bc 1f5c2-1f5c4 1f5d1-1f5d3 1f5dc-1f5de 1f5e1 1f5e3 1f5e8 1f5ef "
+    "1f5f3 1f5fa-1f64f 1f680-1f6c5 1f6cb-1f6d2 1f6d5-1f6e5 1f6e9 1f6eb-1f6f0 1f6f3-1f6ff "
+    "1f7da-1f7ff 1f80c-1f80f 1f848-1f84f 1f85a-1f85f 1f888-1f88f 1f8ae-1f8af 1f8bc-1f8bf "
+    "1f8c2-1f8cf 1f8d9-1f8ff 1f90c-1f93a 1f93c-1f945 1f947-1f9ff 1fa58-1fa5f 1fa6e-1faff "
+    "1fc00-1fffd"
+)
+# Characters 1 column wide alone and 2 with U+FE0F after them, as RGI emoji (U+26A0).
+EMOJI_WITH_VS16 = code_points(
+    "a9 ae 203c 2049 2122 2139 2194-2199 21a9-21aa 2328 23cf 23ed-23ef 23f1-23f2 23f8-23fa "
+    "24c2 25aa-25ab 25b6 25c0 25fb-25fc 2600-2604 260e 2611 2618 261d 2620 2622-2623 2626 "
+    "262a 262e-262f 2638-263a 2640 2642 265f-2660 2663 2665-2666 2668 267b 267e 2692 "
+    "2694-2697 2699 269b-269c 26a0 26a7 26b0-26b1 26c8 26cf 26d1 26d3 26e9 26f0-26f1 26f4 "
+    "26f7-26f9 2702 2708-2709 270c-270d 270f 2712 2714 2716 271d 2721 2733-2734 2744 2747 "
+    "2763-2764 27a1 2934-2935 2b05-2b07 1f170-1f171 1f17e-1f17f 1f321 1f324-1f32c 1f336 1f37d "
+    "1f396-1f397 1f399-1f39b 1f39e-1f39f 1f3cb-1f3ce 1f3d4-1f3df 1f3f3 1f3f5 1f3f7 1f43f "
+    "1f441 1f4fd 1f549-1f54a 1f56f-1f570 1f573-1f579 1f587 1f58a-1f58d 1f590 1f5a5 1f5a8 "
+    "1f5b1-1f5b2 1f5bc 1f5c2-1f5c4 1f5d1-1f5d3 1f5dc-1f5de 1f5e1 1f5e3 1f5e8 1f5ef 1f5f3 "
+    "1f5fa 1f6cb 1f6cd-1f6cf 1f6e0-1f6e5 1f6e9 1f6f0 1f6f3"
+)
+# Characters 1 column wide alone and 2 with a skin tone after them (U+261D).
+SKIN_TONE_BASES = code_points(
+    "261d 26f9 270c-270d 1f3cb-1f3cc 1f574-1f575 1f590"
+)
+# Regional indicator pairs that are RGI flags, 2 columns; any other pair is 1.
+FLAGS = frozenset(
+    (
+        "AC AD AE AF AG AI AL AM AO AQ AR AS AT AU AW AX AZ BA BB BD BE BF BG BH BI BJ BL BM BN "
+        "BO BQ BR BS BT BV BW BY BZ CA CC CD CF CG CH CI CK CL CM CN CO CP CQ CR CU CV CW CX CY "
+        "CZ DE DG DJ DK DM DO DZ EA EC EE EG EH ER ES ET EU FI FJ FK FM FO FR GA GB GD GE GF GG "
+        "GH GI GL GM GN GP GQ GR GS GT GU GW GY HK HM HN HR HT HU IC ID IE IL IM IN IO IQ IR IS "
+        "IT JE JM JO JP KE KG KH KI KM KN KP KR KW KY KZ LA LB LC LI LK LR LS LT LU LV LY MA MC "
+        "MD ME MF MG MH MK ML MM MN MO MP MQ MR MS MT MU MV MW MX MY MZ NA NC NE NF NG NI NL NO "
+        "NP NR NU NZ OM PA PE PF PG PH PK PL PM PN PR PS PT PW PY QA RE RO RS RU RW SA SB SC SD "
+        "SE SG SH SI SJ SK SL SM SN SO SR SS ST SV SX SY SZ TA TC TD TF TG TH TJ TK TL TM TN TO "
+        "TR TT TV TW TZ UA UG UM UN US UY UZ VA VC VE VG VI VN VU WF WS XK YE YT ZA ZM ZW"
+    ).split()
+)
+ZERO_WIDTH_CATEGORIES = frozenset({"Mn", "Me", "Mc", "Cc", "Cf", "Cs"})
+ZERO_WIDTH_LETTERS = frozenset({0x115F, 0x1160, 0x3164, 0xFFA0})  # Hangul fillers
+ZWJ = 0x200D
+VS16 = 0xFE0F
+KEYCAP = 0x20E3
+SKIN_TONES = range(0x1F3FB, 0x1F400)
+HANGUL_JOINS = {
+    ("L", "L"), ("L", "V"), ("L", "LV"), ("L", "LVT"),
+    ("LV", "V"), ("LV", "T"), ("V", "V"), ("V", "T"), ("LVT", "T"), ("T", "T"),
+}
+
+
+def category(code: int) -> str:
+    return unicodedata.category(chr(code))
+
+
+def zero_width(code: int) -> bool:
+    return code in ZERO_WIDTH_LETTERS or category(code) in ZERO_WIDTH_CATEGORIES
+
+
+def east_asian_width(code: int) -> int:
+    return 2 if unicodedata.east_asian_width(chr(code)) in ("W", "F") else 1
+
+
+def hangul(code: int) -> str:
+    if 0x1100 <= code <= 0x115F or 0xA960 <= code <= 0xA97C:
+        return "L"
+    if 0x1160 <= code <= 0x11A7 or 0xD7B0 <= code <= 0xD7C6:
+        return "V"
+    if 0x11A8 <= code <= 0x11FF or 0xD7CB <= code <= 0xD7FB:
+        return "T"
+    if 0xAC00 <= code <= 0xD7A3:
+        return "LV" if (code - 0xAC00) % 28 == 0 else "LVT"
+    return ""
+
+
+def grapheme_extend(code: int) -> bool:
+    """Grapheme_Cluster_Break Extend: marks, the spacing marks that extend (U+09BE), ZWNJ,
+    skin tones and tags. It keeps an emoji ZWJ sequence or (but for ZWNJ) a conjunct going."""
+    return (
+        category(code) in ("Mn", "Me")
+        or code in INCB_SPACING_EXTEND
+        or code in (0x200C, 0xFF9E, 0xFF9F)
+        or code in SKIN_TONES
+        or 0xE0020 <= code <= 0xE007F
+    )
+
+
+def extends(code: int) -> bool:
+    """Never starts a cluster: Grapheme_Cluster_Break Extend, ZWJ or SpacingMark."""
+    spacing_mark = category(code) == "Mc" or code in (0x0E33, 0x0EB3)
+    return grapheme_extend(code) or code == ZWJ or spacing_mark
+
+
+def control(code: int) -> bool:
+    """Grapheme_Cluster_Break Control, approximately: nothing joins after it."""
+    kind = category(code)
+    if kind == "Cf":
+        return not extends(code) and code not in PREPEND
+    return kind in ("Cc", "Zl", "Zp")
+
+
+def regional(code: int) -> bool:
+    return 0x1F1E6 <= code <= 0x1F1FF
+
+
+def clusters(text: str):
+    """Extended grapheme clusters (UAX #29) of `text`, as lists of code points, approximately."""
+    cluster: list[int] = []
+    regionals = 0  # regional indicators at the end of the cluster
+    conjunct = 0  # 1 after an Indic consonant, 2 once a linker follows it
+    pictograph = 0  # 1 after an Extended_Pictographic, 2 once a ZWJ follows it (rule GB11)
+    for char in text:
+        code = ord(char)
+        if cluster:
+            previous = cluster[-1]
+            joins = not control(previous) and (
+                extends(code)
+                or (hangul(previous), hangul(code)) in HANGUL_JOINS
+                or (previous in PREPEND and not control(code))
+                or (pictograph == 2 and code in EXTENDED_PICTOGRAPHIC)
+                or (conjunct == 2 and code in INCB_CONSONANTS)
+                or (regional(code) and regionals % 2 == 1)
+            )
+            if not joins:
+                yield cluster
+                cluster, regionals, conjunct, pictograph = [], 0, 0, 0
+        cluster.append(code)
+        regionals = regionals + 1 if regional(code) else 0
+        if code in EXTENDED_PICTOGRAPHIC:
+            pictograph = 1
+        elif code == ZWJ:
+            pictograph = 2 if pictograph == 1 else 0
+        elif not (pictograph == 1 and grapheme_extend(code)):
+            pictograph = 0
+        if code in INCB_CONSONANTS:
+            conjunct = 1
+        elif code in INCB_LINKERS and conjunct:
+            conjunct = 2
+        elif not (conjunct and (code == ZWJ or (grapheme_extend(code) and code != 0x200C))):
+            conjunct = 0
+    if cluster:
+        yield cluster
+
+
+def flag(cluster: list[int]) -> str:
+    """The two letters a pair of regional indicators spells (U+1F1E8 U+1F1F1 is CL)."""
+    return "".join(chr(code - 0x1F1E6 + ord("A")) for code in cluster)
+
+
+def emoji(cluster: list[int]) -> bool:
+    """Whether `string-width` counts a multi-code-point cluster as a 2-column emoji."""
+    base = cluster[0]
+    return len(cluster) > 1 and (
+        (chr(base) in "0123456789#*" and cluster[1:] in ([VS16, KEYCAP], [KEYCAP]))
+        or (cluster[1:] == [VS16] and base in EMOJI_WITH_VS16)
+        or (len(cluster) == 2 and cluster[1] in SKIN_TONES and base in SKIN_TONE_BASES)
+        or (len(cluster) == 2 and all(map(regional, cluster)) and flag(cluster) in FLAGS)
+        or (ZWJ in cluster and sum(code in EXTENDED_PICTOGRAPHIC for code in cluster) >= 2)
+    )
+
+
+def jamo_width(codes: list[int]) -> int:
+    """Hangul jamo: a leading consonant, a vowel and an optional trailing consonant take 2."""
+    width = 0
+    k = 0
+    while k < len(codes):
+        kind = hangul(codes[k])
+        if kind not in ("L", "V", "T"):
+            return width + sum(map(east_asian_width, codes[k:]))
+        if kind == "L" and k + 1 < len(codes) and hangul(codes[k + 1]) == "V":
+            width += 2
+            k += 3 if k + 2 < len(codes) and hangul(codes[k + 2]) == "T" else 2
+            continue
+        width += east_asian_width(codes[k])
+        k += 1
+    return width
+
+
+def cluster_width(cluster: list[int]) -> int:
+    if all(map(zero_width, cluster)):
+        return 0
+    if emoji(cluster):
+        return 2
+    while zero_width(cluster[0]):
+        cluster = cluster[1:]
+    if hangul(cluster[0]) in ("L", "V", "T"):
+        return jamo_width([code for code in cluster if not zero_width(code)])
+    halfwidth = sum(east_asian_width(code) for code in cluster[1:] if 0xFF00 <= code <= 0xFFEF)
+    return east_asian_width(cluster[0]) + halfwidth
+
+
 def display_width(text: str) -> int:
-    """Columns `text` takes, counted as characters: exact for ASCII, not for wide ones."""
-    return len(text)
+    """Columns `text` takes in a monospaced editor, as `string-width` (MD060) counts them."""
+    if text.isascii() and text.isprintable():
+        return len(text)
+    if any(0xDC80 <= ord(char) <= 0xDCFF for char in text):  # bytes that are not UTF-8
+        text = text.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+    return sum(map(cluster_width, clusters(text)))
 
 
 def columns(prefix: str) -> int:
@@ -155,7 +408,8 @@ def is_delimiter_row(row: str) -> bool:
 
 
 def pipe_columns(line: str) -> list[int]:
-    """Display column of each cell-separating `|`, adding up the pieces between them."""
+    """Display column of each cell-separating `|`, adding up the pieces between them: no
+    cluster crosses a `|` (marks after one join it, and they are zero width)."""
     result = []
     column = previous = 0
     for i in unescaped_pipes(line):
