@@ -10,6 +10,10 @@ pytest, and these need none):
 The module under test is `scripts/md_table_align.py`, loaded by path, so that it does not
 depend on `scripts/` being importable.
 
+`md_table_align/` holds slower checks, run by hand: `oracle.py` checks the script against
+markdownlint itself, in its Docker image, on these tests' documents or generated ones, and
+`fuzz.py` compares two versions of the script on generated documents.
+
 Every fixture is synthetic, so nothing here names a company, customer or account.
 """
 import contextlib
