@@ -466,6 +466,68 @@ class CellTest(Case):
         )
 
 
+def comment(text: str) -> str:
+    return f"<!-- markdownlint-{text} -->\n"
+
+
+class DisableCommentTest(Case):
+    """markdownlint's comments: a table is aligned when MD060 would report one of its rows."""
+
+    def test_a_disabled_range(self):
+        head = comment("disable MD060") + TABLE + comment("enable MD060")
+        self.check(head + TABLE, head + ALIGNED)
+
+    def test_the_names_that_reach_md060(self):
+        for names in (" MD060", " md060", " Table-Column-Style", " table", " MD013 MD060", ""):
+            with self.subTest(names=names):
+                self.check(comment("disable" + names) + TABLE)
+
+    def test_a_comment_naming_another_rule(self):
+        self.check(comment("disable MD013") + TABLE, comment("disable MD013") + ALIGNED)
+
+    def test_disable_next_line_above_the_header_exempts_nothing(self):
+        line = comment("disable-next-line MD060")
+        self.check(line + TABLE, line + ALIGNED)
+
+    def test_disable_line_on_the_only_row_off(self):
+        table = "| a    | b   |\n|------|-----|\n| c{} | d |\n"
+        self.check(table.format(" <!-- markdownlint-disable-line MD060 -->"))
+        self.check(table.format(""), "| a   | b   |\n|-----|-----|\n| c   | d   |\n")
+
+    def test_a_table_reported_on_another_row_is_aligned_whole(self):
+        cell = "c <!-- markdownlint-disable-line MD060 -->"
+        width = len(cell)
+        self.check(
+            f"| a | b |\n|-|-|\n| {cell} | d |\n",
+            f"| {'a':<{width}} | b   |\n|{'-' * (width + 2)}|-----|\n| {cell} | d   |\n",
+        )
+
+    def test_disable_file_anywhere(self):
+        self.check(TABLE + "\n" + comment("disable-file MD060"))
+
+    def test_a_comment_in_code_counts_too(self):
+        self.check("```\n" + comment("disable MD060") + "```\n\n" + TABLE)
+
+    def test_a_comment_in_front_matter_does_not(self):
+        for action in ("disable MD060", "disable-file MD060"):
+            head = "---\n# " + comment(action) + "---\n"
+            with self.subTest(action=action):
+                self.check(head + TABLE, head + ALIGNED)
+
+    def test_capture_and_restore(self):
+        head = comment("disable MD060") + comment("capture") + comment("enable MD060")
+        tail = "\n" + comment("restore") + TABLE
+        self.check(head + TABLE + tail, head + ALIGNED + tail)
+
+    def test_restore_without_capture_undoes_disable_file(self):
+        head = comment("disable-file MD060") + comment("restore")
+        self.check(head + TABLE, head + ALIGNED)
+
+    def test_a_comment_without_its_end_on_its_line_is_ignored(self):
+        head = "<!-- markdownlint-disable MD060\n-->\n"
+        self.check(head + TABLE, head + ALIGNED)
+
+
 class LineEndingTest(Case):
     """Line endings and a byte order mark pass through."""
 

@@ -5,10 +5,10 @@ Usage:
     scripts/md_table_align.py < doc.md | diff -u doc.md -
     printf '%s\n' '| a | b |' '|-|-|' '| long cell | c |' | scripts/md_table_align.py
 
-Reads Markdown on stdin and writes it to stdout with every misaligned table padded so that its
-pipes line up. It opens no file, so it cannot write one: compare the output with the original
-and apply the difference with the editing tool. Tables it leaves alone for a reason the author
-should know about are reported on stderr with their line number.
+Reads Markdown on stdin and writes it to stdout with every table that MD060 would report padded
+so that its pipes line up. It opens no file, so it cannot write one: compare the output with the
+original and apply the difference with the editing tool. Tables it leaves alone for a reason the
+author should know about are reported on stderr with their line number.
 
 It exists because markdownlint-cli reports MD060 for the `aligned` style and cannot fix it.
 It needs Python 3.10 or later and nothing outside the standard library.
@@ -21,7 +21,14 @@ Rules:
         under paragraph text, `--` alone underlines a heading.
         It may interrupt paragraph text: of `| a |`, `| b |`, `|---|` the table is the last two
         lines. Other lines starting with `|` are paragraph text, left as they are
-    - A table whose pipes already line up (as MD060 measures them) is left as it is
+    - A table is aligned when MD060 would report it: when a row after the header has a pipe off
+        the header's pipes, on a line where markdownlint's comments leave MD060 enabled. It is
+        then aligned whole, rows on lines where MD060 is disabled included
+    - Those comments are read as markdownlint reads them: on every line after the front matter,
+        in code too, naming MD060 as `MD060`, `table-column-style` or `table` in any case, or
+        naming no rule at all (`<!-- markdownlint-disable -->`). `markdownlint-configure-file`
+        comments and markdownlint's configuration files are not read: MD060's `aligned` style
+        is assumed
     - Front matter (as markdownlint finds it), fenced code blocks, HTML blocks and indented
         code blocks are left as they are; indentation is measured from the enclosing list
         item, also when a fence or an HTML block starts on the item's marker line
@@ -92,6 +99,12 @@ SETEXT_UNDERLINE = re.compile(r"(?:=+|-+)[ \t]*")  # under paragraph text
 THEMATIC_BREAK = re.compile(r"(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})$")
 FRONT_MATTER = {"---": ("---",), "+++": ("+++", "..."), "{": ("}",)}  # markdownlint's
 BOM = "\N{ZERO WIDTH NO-BREAK SPACE}"
+INLINE_CONFIG = re.compile(  # markdownlint's comments; what they name runs to the next `-->`
+    r"(<!--\s*markdownlint-(disable|enable|capture|restore|disable-file|enable-file|disable-line"
+    r"|disable-next-line|configure-file))(?:\s|-->)",
+    re.I,
+)
+MD060_NAMES = frozenset({"MD060", "TABLE-COLUMN-STYLE", "TABLE"})  # its name, alias and tag
 
 HTML_BLOCK_NAMES = (
     "address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|"
@@ -419,16 +432,19 @@ def pipe_columns(line: str) -> list[int]:
     return result
 
 
-def is_aligned(block: list[str]) -> bool:
-    """MD060's `aligned` check: every pipe of a row sits on a column of a header pipe."""
+def misaligned_rows(block: list[str]) -> list[int]:
+    """MD060's `aligned` check: the offsets in `block` of the rows with a pipe off the columns
+    of the header's pipes. MD060 reports each on its own line, and never the header."""
     header = set(pipe_columns(block[0]))
-    for line in block[1:]:
+    offsets = []
+    for offset, line in enumerate(block[1:], start=1):
         remaining = set(header)
         for column in pipe_columns(line):
             if remaining and column not in remaining:
-                return False
+                offsets.append(offset)
+                break
             remaining.discard(column)
-    return True
+    return offsets
 
 
 def delimiter_cell(spec: str, width: int) -> str:
@@ -586,8 +602,9 @@ def leaf_start(content: str, interrupting: bool):
     return block_start(content, interrupting)
 
 
-def format_block(block: list[str], start: int, first_line: int) -> list[str]:
-    """Align `block` if it is a table; its first row starts at index `start` of `block[0]`."""
+def format_block(block: list[str], start: int, first_line: int, enabled: list[bool]) -> list[str]:
+    """Align `block` if it is a table that MD060 would report; its first row starts at index
+    `start` of `block[0]`, and `enabled` tells, by line index, where MD060 is enabled."""
     if len(block) < 2:
         return block
     rows = [block[0][start:], *block[1:]]
@@ -603,8 +620,8 @@ def format_block(block: list[str], start: int, first_line: int) -> list[str]:
         if cells > len(delimiter):
             warn(first_line + offset, f"{cells} cells for {len(delimiter)} columns; "
                  "GFM does not render the extra ones (an unescaped `|`?), kept as they are")
-    if is_aligned(block):
-        return block
+    if not any(enabled[first_line - 1 + offset] for offset in misaligned_rows(block)):
+        return block  # aligned already, or MD060 is disabled on every line it would report
     prefix = block[0][:start]
     if not prefix.strip(SPACE):
         return align_table(rows, prefix, prefix)
@@ -633,6 +650,58 @@ def front_matter_end(lines: list[str]) -> int:
             if lines[i].rstrip() in closers:
                 return i + 1
     return 0
+
+
+def inline_config(line: str):
+    """The action and the names of each markdownlint comment on `line`, as markdownlint finds
+    them: one with no `-->` after it on the line ends the search."""
+    position = 0
+    while match := INLINE_CONFIG.search(line, position):
+        end = line.find("-->", match.end(1))
+        if end == -1:
+            return
+        yield match[2].upper(), line[match.end(1) : end]
+        position = match.end()
+
+
+def names_md060(names: str) -> bool:
+    """Whether a comment naming `names` reaches MD060: no name at all means every rule."""
+    words = names.upper().split()
+    return not words or not MD060_NAMES.isdisjoint(words)
+
+
+def md060_enabled(lines: list[str], body: int) -> list[bool]:
+    """For each line, whether markdownlint's comments leave MD060 enabled on it. Like
+    markdownlint, this reads every line from index `body` on (after the front matter), in code
+    too, in 3 passes."""
+    comments = [
+        [action for action, names in inline_config(line)
+         if action in ("CAPTURE", "RESTORE") or names_md060(names)]  # those two take no names
+        if number >= body else []
+        for number, line in enumerate(lines)
+    ]
+    enabled = True
+    for line in comments:  # the `-file` comments set the state the document starts in
+        for action in line:
+            if action in ("ENABLE-FILE", "DISABLE-FILE"):
+                enabled = action == "ENABLE-FILE"
+    captured = True  # so a `restore` before any `capture` undoes the `-file` comments
+    states = []
+    for line in comments:  # each comment takes effect on its own line
+        for action in line:
+            if action == "CAPTURE":
+                captured = enabled
+            elif action == "RESTORE":
+                enabled = captured
+            elif action in ("ENABLE", "DISABLE"):
+                enabled = action == "ENABLE"
+        states.append(enabled)
+    for number, line in enumerate(comments):
+        for action in line:
+            target = number + (action == "DISABLE-NEXT-LINE")
+            if action in ("DISABLE-LINE", "DISABLE-NEXT-LINE") and target < len(states):
+                states[target] = False
+    return states
 
 
 def ends_at_blank(content: str, relative: int) -> bool:
@@ -692,6 +761,7 @@ def align_document(text: str) -> str:
     bodies = [line.rstrip("\r\n") for line in lines]
     endings = [line[len(body) :] for line, body in zip(lines, bodies, strict=True)]
     out = list(bodies)
+    enabled = md060_enabled(bodies, front_matter_end(bodies))
 
     def delimiter(i: int, stack: list[Container]) -> str:
         """What line `i + 1` holds, if it can be a delimiter row under line `i`: in all the
@@ -741,7 +811,7 @@ def align_document(text: str) -> str:
             warn(i + 1, f"{line_span(i + 1, end)}a table whose header is less indented than its "
                  "list item, unlike its rows; left as it is")
         else:
-            out[i:piped] = format_block(bodies[i:piped], start, i + 1)
+            out[i:piped] = format_block(bodies[i:piped], start, i + 1, enabled)
             if end > piped:
                 warn(piped + 1, f"{line_span(piped + 1, end)}the table above continues without "
                      "a leading `|`; not aligned")
@@ -793,7 +863,7 @@ def align_document(text: str) -> str:
             below = delimiter(i, within)  # no table starts on a lazy line right after one
             table = is_table([content, below])
             if not table and content.startswith("|") and not any(c.quote for c in within):
-                format_block([content, below], 0, i + 1)  # for its warning, if any
+                format_block([content, below], 0, i + 1, enabled)  # for its warning, if any
             elif table and paragraph and not lazy and (fresh := block_start(content, False)):
                 ends, table = fresh, False  # a table ends the paragraph; a lone HTML tag starts
         if paragraph and content and (code or (ends is None and not table)):
